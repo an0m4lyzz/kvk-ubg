@@ -1,5 +1,5 @@
 -- Arsenal_Assist_ESP.lua
--- Revision: tablet3, cumulative camera tracking and on-device diagnostics.
+-- Revision: tablet4, stable head/torso preference with visible-part fallback.
 -- Client source: LocalScript in your own place, or a client runtime exposing Roblox APIs.
 -- No Studio-only restriction, remote manipulation, or external dependency.
 -- See README.md in this directory for controls, local-resize limits, and verification scope.
@@ -11,6 +11,7 @@ local Config = {
         FOV = 180, -- Fast tablet preset; radius in viewport pixels.
         Smoothness = 0.35, -- Fraction corrected in 1/60 second; no instant snapping.
         TargetPart = "UpperTorso",
+        HeadChance = 0.70, -- Head preference per new lock, not a shot/hit percentage.
         TeamCheck = true,
         WallCheck = true,
         AliveCheck = true,
@@ -86,9 +87,10 @@ local function copy(value)
 end
 
 local defaults = copy(Config) -- Reset returns to the initial table in this file.
+local aimRandom = Random.new()
 local numberLimits = {
     AimAssist = {
-        FOV = {5, 1000}, Smoothness = {0, 0.5}, PredictionSeconds = {0, 0.25},
+        FOV = {5, 1000}, Smoothness = {0, 0.5}, PredictionSeconds = {0, 0.25}, HeadChance = {0, 1},
     },
     ESP = {MaxDistance = {0, 10000}},
     Hitbox = {Size = {2, 12}, MaxDistance = {0, 10000}},
@@ -179,6 +181,9 @@ local connections = {}
 local records = {}
 local camera = Workspace.CurrentCamera
 local target = nil
+local targetAimPart = nil
+local pendingHeadPreference = nil
+local nextHeadPreference = nil
 local held = false
 local activationSource = nil
 local touchInput = nil
@@ -230,12 +235,16 @@ local function disconnectAll(bucket)
     table.clear(bucket)
 end
 
+local function clearSelectedTarget()
+    target, targetAimPart, pendingHeadPreference, nextHeadPreference = nil, nil, nil, nil
+    scanElapsed = math.huge
+end
+
 local function releaseAim()
     held = false
     activationSource = nil
     touchInput = nil
-    target = nil
-    scanElapsed = math.huge
+    clearSelectedTarget()
     resetCameraMemory()
     diagnostics.ActiveFrames = 0
     diagnostics.PixelError = nil
@@ -297,7 +306,7 @@ local function refreshParts(record)
 end
 
 local function clearCharacter(record)
-    if target == record then target = nil; scanElapsed = math.huge end
+    if target == record then clearSelectedTarget() end
     disconnectAll(record.characterConnections)
     if restoreHitbox then restoreHitbox(record) end
     destroyVisuals(record)
@@ -316,19 +325,22 @@ local function setCharacter(record, character)
         if child:IsA("BasePart") or child:IsA("Humanoid") then refreshParts(record) end
     end, record.characterConnections)
     connect(character.ChildRemoved, function(child)
+        local removedHumanoid = child == record.humanoid
         local changedAim = child == record.aimPart or child == record.humanoid
         local changedVisual = child == record.root or child == record.labelPart or child == record.humanoid
         local changedHitbox = child == record.hitboxPart
         if not changedAim and not changedVisual and not changedHitbox then return end
         if changedHitbox and restoreHitbox then restoreHitbox(record) end
         refreshParts(record)
-        if changedAim and target == record then target = nil; scanElapsed = math.huge end
+        -- Losing an unselected torso must not discard a still-valid head lock.
+        -- Selected-part loss is validated/falls back during the next render.
+        if removedHumanoid and target == record then clearSelectedTarget() end
         -- A cached adornee may have just streamed out.
         if changedVisual then destroyVisuals(record) end
     end, record.characterConnections)
     connect(character.AncestryChanged, function()
         if not character:IsDescendantOf(Workspace) then
-            if target == record then target = nil end
+            if target == record then clearSelectedTarget() end
             if restoreHitbox then restoreHitbox(record) end
             destroyVisuals(record)
         end
@@ -337,8 +349,7 @@ local function setCharacter(record, character)
 end
 
 local function invalidateTeams()
-    target = nil
-    scanElapsed = math.huge
+    clearSelectedTarget()
     espElapsed = math.huge
 end
 
@@ -415,15 +426,16 @@ local function visible(character, position)
     return result == nil or result.Instance:IsDescendantOf(character)
 end
 
-local function eligibleTarget(record, radiusSquared)
+local function eligibleTarget(record, radiusSquared, aimPart)
     if not recordIsPresent(record) then return nil, nil, "INVALID" end
     if not isEnemy(record.player, Config.AimAssist.TeamCheck) then return nil, nil, "TEAM" end
     if Config.AimAssist.AliveCheck and not isAlive(record) then return nil, nil, "DEAD" end
-    if not partIsPresent(record.aimPart, record.character) then return nil, nil, "PART" end
+    aimPart = aimPart or record.aimPart
+    if not partIsPresent(aimPart, record.character) then return nil, nil, "PART" end
 
-    local position = record.aimPart.Position
+    local position = aimPart.Position
     if Config.AimAssist.Prediction then
-        position = position + record.aimPart.AssemblyLinearVelocity * Config.AimAssist.PredictionSeconds
+        position = position + aimPart.AssemblyLinearVelocity * Config.AimAssist.PredictionSeconds
     end
     local point, onScreen = camera:WorldToViewportPoint(position)
     if not onScreen or point.Z <= 0 then return nil, nil, "OFFSCREEN" end
@@ -434,29 +446,79 @@ local function eligibleTarget(record, radiusSquared)
     return position, distanceSquared
 end
 
-local function targetIsVisible(record, position)
+local function targetIsVisible(record, position, aimPart)
     if not Config.AimAssist.WallCheck then return true end
-    -- Check the real torso as well as an optional predicted aim point.
-    if not visible(record.character, record.aimPart.Position) then return false end
+    aimPart = aimPart or record.aimPart
+    -- Check the actual selected part, including an optional predicted aim point.
+    if not visible(record.character, aimPart.Position) then return false end
     return not Config.AimAssist.Prediction or visible(record.character, position)
 end
 
+local function rollHeadPreference()
+    local chance = Config.AimAssist.HeadChance
+    return chance >= 1 or (chance > 0 and aimRandom:NextNumber() < chance)
+end
+
+local function evaluateAimPart(record, radiusSquared, part)
+    if not part then return nil, nil, "PART", nil end
+    local position, distance, reason = eligibleTarget(record, radiusSquared, part)
+    if not position then return nil, nil, reason, nil end
+    if not targetIsVisible(record, position, part) then return nil, nil, "BLOCKED", nil end
+    return position, distance, nil, part
+end
+
+local function chooseAimPoint(record, radiusSquared, preferHead)
+    local head = record.character and partNamed(record.character, "Head")
+    local body = record.aimPart
+    local first = preferHead and head or body
+    local second = preferHead and body or (Config.AimAssist.HeadChance > 0 and head or nil)
+    local position, distance, reason, chosen = evaluateAimPart(record, radiusSquared, first)
+    if position then return position, distance, nil, chosen end
+    if second and second ~= first then
+        local nextPosition, nextDistance, nextReason, nextPart = evaluateAimPart(record, radiusSquared, second)
+        if nextPosition then return nextPosition, nextDistance, nil, nextPart end
+        if reason ~= "BLOCKED" then reason = nextReason end
+    end
+    return nil, nil, reason, nil
+end
+
 local function acquireTarget(radiusSquared)
-    local best, bestPosition, bestDistance = nil, nil, math.huge
+    local candidatePreference
+    if target then
+        -- Queue the next lock's preference once, and rank its actual point before
+        -- switching players. Never reroll the winner after distance comparison.
+        if nextHeadPreference == nil then nextHeadPreference = rollHeadPreference() end
+        candidatePreference = nextHeadPreference
+    else
+        if pendingHeadPreference == nil then pendingHeadPreference = rollHeadPreference() end
+        candidatePreference = pendingHeadPreference
+    end
+    local best, bestPosition, bestPart, bestDistance = nil, nil, nil, math.huge
     diagnostics.Scans = diagnostics.Scans + 1
     diagnostics.Candidates, diagnostics.InFOV, diagnostics.Blocked, diagnostics.Outside = 0, 0, 0, 0
     for _, record in pairs(records) do
         diagnostics.Candidates = diagnostics.Candidates + 1
-        local position, distanceSquared, reason = eligibleTarget(record, radiusSquared)
+        local position, distanceSquared, reason, chosenPart
+        if record == target and targetAimPart then
+            position, distanceSquared, reason, chosenPart = evaluateAimPart(record, radiusSquared, targetAimPart)
+        else
+            position, distanceSquared, reason, chosenPart = chooseAimPoint(record, radiusSquared, candidatePreference)
+        end
         if position then diagnostics.InFOV = diagnostics.InFOV + 1
+        elseif reason == "BLOCKED" then
+            diagnostics.InFOV = diagnostics.InFOV + 1
+            diagnostics.Blocked = diagnostics.Blocked + 1
         elseif reason == "FOV" or reason == "OFFSCREEN" then diagnostics.Outside = diagnostics.Outside + 1 end
         local winsTie = best ~= nil and distanceSquared == bestDistance
             and record.player.UserId < best.player.UserId
         if position and (distanceSquared < bestDistance or winsTie) then
-            if targetIsVisible(record, position) then
-                best, bestPosition, bestDistance = record, position, distanceSquared
-            else diagnostics.Blocked = diagnostics.Blocked + 1 end
+            best, bestPosition, bestPart, bestDistance = record, position, chosenPart, distanceSquared
         end
+    end
+    -- Consume the queued preference only when a different player actually wins.
+    if best and target and best ~= target then
+        pendingHeadPreference = nextHeadPreference
+        nextHeadPreference = nil
     end
     if not best then
         if diagnostics.Candidates == 0 then setAimStatus("NO_PLAYERS", "no other players")
@@ -464,7 +526,7 @@ local function acquireTarget(radiusSquared)
         elseif diagnostics.Outside > 0 then setAimStatus("OUTSIDE_FOV", "move camera closer")
         else setAimStatus("NO_ELIGIBLE", "team, health or parts") end
     end
-    return best, bestPosition
+    return best, bestPosition, bestPart
 end
 
 -- 5. Local root resize and ESP ----------------------------------------------------
@@ -678,7 +740,9 @@ local function getStats()
         TargetUserId = target and target.player.UserId or nil,
         ActivationHeld = held, RenderBound = renderBound,
         ActivationSource = activationSource,
-        Revision = "tablet3",
+        Revision = "tablet4",
+        AimPart = targetAimPart and targetAimPart.Name or nil,
+        PreferredHead = pendingHeadPreference,
         RenderPhases = #renderBindings,
         Diagnostics = copy(diagnostics),
     }
@@ -686,8 +750,9 @@ end
 
 local function diagnosticReport()
     local errorText = diagnostics.PixelError and string.format("%.1f", diagnostics.PixelError) or "none"
-    return string.format("KVK Arsenal tablet3 | manual fire\nstate=%s (%s)\ntarget=%s camera=%s armed=%s\nFOV=%d strength=%.3f errorPx=%s\nscans=%d candidates=%d inFOV=%d blocked=%d overrides=%d rebases=%d\nlocalHitbox=%s",
+    return string.format("KVK Arsenal tablet4 | manual fire\nstate=%s (%s)\ntarget=%s aimPart=%s camera=%s armed=%s\nFOV=%d strength=%.3f errorPx=%s\nscans=%d candidates=%d inFOV=%d blocked=%d overrides=%d rebases=%d\nlocalHitbox=%s",
         diagnostics.State, diagnostics.Detail, target and target.player.Name or "none",
+        targetAimPart and targetAimPart.Name or "none",
         camera and camera.CameraType.Name or "none", tostring(held), Config.AimAssist.FOV,
         Config.AimAssist.Smoothness, errorText, diagnostics.Scans, diagnostics.Candidates,
         diagnostics.InFOV, diagnostics.Blocked, diagnostics.CameraOverwrites,
@@ -771,7 +836,7 @@ local function buildUI()
             applyConfig({[section] = {[key] = not Config[section][key]}})
         end)
     end
-    local function numeric(label, section, key, step, format)
+    local function numeric(label, section, key, step, format, displayFactor)
         order = order + 1
         local row = create("Frame", {
             Size = UDim2.new(1, -8, 0, rowHeight), BackgroundTransparency = 1, LayoutOrder = order,
@@ -784,10 +849,11 @@ local function buildUI()
         local minus = button(row, "-", UDim2.fromOffset(36, rowHeight), UDim2.new(1, -80, 0, 0))
         local plus = button(row, "+", UDim2.fromOffset(36, rowHeight), UDim2.new(1, -40, 0, 0))
         table.insert(refreshers, function()
-            caption.Text = label .. ": " .. string.format(format, Config[section][key])
+            caption.Text = label .. ": " .. string.format(format, Config[section][key] * (displayFactor or 1))
         end)
         connect(minus.Activated, function() applyConfig({[section] = {[key] = Config[section][key] - step}}) end)
         connect(plus.Activated, function() applyConfig({[section] = {[key] = Config[section][key] + step}}) end)
+        return row
     end
     local aimPresets = {
         {Name = "Subtle", Strength = 0.055, FOV = 75},
@@ -826,6 +892,8 @@ local function buildUI()
     toggle("ESP [F3]", "ESP", "Enabled")
     numeric("Tracking strength", "AimAssist", "Smoothness", 0.025, "%.3f")
     numeric("FOV radius (pixels)", "AimAssist", "FOV", 5, "%.0f")
+    local headPreference = numeric("Head preference", "AimAssist", "HeadChance", 0.1, "%.0f%%", 100)
+    headPreference.Name = "HeadPreference"
     numeric("ESP range (studs)", "ESP", "MaxDistance", 25, "%.0f")
     toggle("Show FOV [F4]", "AimAssist", "ShowFOV")
     toggle("Retain target", "AimAssist", "TargetLock")
@@ -1012,7 +1080,7 @@ local function onRender(dt)
     diagnostics.Frames = diagnostics.Frames + 1
     if rayFilterDirty then refreshRayFilter() end
     if not camera or not camera.Parent then
-        target = nil
+        clearSelectedTarget()
         resetCameraMemory()
         setAimStatus("WAIT_CAMERA", "CurrentCamera unavailable")
         if fovCircle then fovCircle.Visible = false end
@@ -1042,7 +1110,7 @@ local function onRender(dt)
     if dt <= 0 or dt > 0.25 or viewport.X <= 0 or viewport.Y <= 0
         or UserInputService.VREnabled or camera.CameraType ~= Enum.CameraType.Custom
         or not localCharacterIsAlive() then
-        target = nil
+        clearSelectedTarget()
         resetCameraMemory()
         if camera.CameraType ~= Enum.CameraType.Custom then setAimStatus("CAMERA_PAUSED", camera.CameraType.Name)
         elseif not localCharacterIsAlive() then setAimStatus("NO_CHARACTER", "waiting for alive character")
@@ -1061,11 +1129,18 @@ local function onRender(dt)
     local radiusSquared = Config.AimAssist.FOV * Config.AimAssist.FOV
     local position = nil
     if target then
-        position = eligibleTarget(target, radiusSquared)
-        if not position or not targetIsVisible(target, position) then
-            target = nil
-            position = nil
-            scanElapsed = math.huge
+        position = evaluateAimPart(target, radiusSquared, targetAimPart)
+        if not position then
+            local head = target.character and partNamed(target.character, "Head")
+            local alternative = targetAimPart ~= target.aimPart and target.aimPart
+                or (Config.AimAssist.HeadChance > 0 and head or nil)
+            if alternative ~= targetAimPart then
+                local fallbackPosition, _, _, fallbackPart = evaluateAimPart(target, radiusSquared, alternative)
+                if fallbackPosition then position, targetAimPart = fallbackPosition, fallbackPart end
+            end
+        end
+        if not position then
+            clearSelectedTarget()
         end
     end
     scanElapsed = scanElapsed + dt
@@ -1073,7 +1148,7 @@ local function onRender(dt)
     -- Only optional reselection of an already valid target is rate limited.
     if not target or (not Config.AimAssist.TargetLock
         and scanElapsed >= Config.Performance.AcquireInterval) then
-        target, position = acquireTarget(radiusSquared)
+        target, position, targetAimPart = acquireTarget(radiusSquared)
         scanElapsed = 0
     end
     if not target or not position then resetCameraMemory(); diagnostics.PixelError = nil; return end
@@ -1089,7 +1164,8 @@ local function onRender(dt)
     local point = camera:WorldToViewportPoint(position)
     local dx, dy = point.X - viewport.X * 0.5, point.Y - viewport.Y * 0.5
     diagnostics.PixelError = math.sqrt(dx * dx + dy * dy)
-    setAimStatus(diagnostics.PixelError <= 4 and "LOCKED" or "TRACKING", "manual fire")
+    setAimStatus(diagnostics.PixelError <= 4 and "LOCKED" or "TRACKING",
+        targetAimPart and targetAimPart.Name or "manual fire")
 end
 
 local function observeCamera()
@@ -1193,5 +1269,6 @@ if not ok then
     warn("[ArsenalAssist] Initialization failed: " .. tostring(initError))
     cleanup()
 end
+
 
 
