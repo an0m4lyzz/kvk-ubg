@@ -1,14 +1,14 @@
 -- Arsenal_Assist_ESP.lua
 -- Client source: LocalScript in your own place, or a client runtime exposing Roblox APIs.
 -- No Studio-only restriction, remote manipulation, or external dependency.
--- See Arsenal_Assist_ESP_Guide.md for controls, configuration, and verification scope.
+-- See README.md in this directory for controls, local-resize limits, and verification scope.
 
 local Config = {
     AimAssist = {
         Enabled = true,
         ActivationKey = Enum.UserInputType.MouseButton2,
-        FOV = 75, -- Radius in viewport pixels, not degrees or studs.
-        Smoothness = 0.055, -- Fraction corrected in 1/60 second; larger = stronger.
+        FOV = 140, -- Radius in viewport pixels, not degrees or studs.
+        Smoothness = 0.22, -- Faster tablet preset; fraction corrected in 1/60 second.
         TargetPart = "UpperTorso",
         TeamCheck = true,
         WallCheck = true,
@@ -28,6 +28,13 @@ local Config = {
         ShowHealth = false,
         MaxDistance = 300, -- Studs from the current camera to character root.
     },
+    Hitbox = {
+        Enabled = true, -- Experimental LOCAL resize; server hit acceptance is unverified.
+        Size = 6, -- Minimum root-part size on each axis, in studs; never shrink originals.
+        ShowBox = true, -- Visualizes the local resize, not confirmed damage registration.
+        TeamCheck = true,
+        MaxDistance = 300,
+    },
     Mobile = {
         Enabled = true, -- Show touch controls when TouchEnabled is true.
         ActivationMode = "Toggle", -- "Toggle" (tap on/off) or "Hold".
@@ -40,7 +47,7 @@ local Config = {
         AutoCleanup = true,
         DebugMode = false,
         ESPInterval = 0.10,
-        AcquireInterval = 0.075,
+        AcquireInterval = 0.04,
         MaxHighlights = 64, -- Our budget only; other systems share the engine limit.
         IdleVisualLifetime = 2,
     },
@@ -83,6 +90,7 @@ local numberLimits = {
         FOV = {5, 1000}, Smoothness = {0, 0.5}, PredictionSeconds = {0, 0.25},
     },
     ESP = {MaxDistance = {0, 10000}},
+    Hitbox = {Size = {2, 12}, MaxDistance = {0, 10000}},
     Mobile = {ButtonScale = {0.75, 1.5}, DockX = {0, 1}, DockY = {0, 1}},
     Performance = {
         ESPInterval = {0.05, 1}, AcquireInterval = {0.025, 1},
@@ -183,11 +191,13 @@ local espElapsed = 0
 local scanElapsed = math.huge
 local clock = 0
 local gui, panel, statusLabel, fovCircle, uiScale
-local touchDock, touchAimButton, touchESPButton, touchScale, touchDockCenter
+local touchDock, touchAimButton, touchESPButton, touchHitboxButton, touchScale, touchDockCenter
 local refreshUI
 local refreshRayFilter
 local refreshTouchState
 local layoutTouchDock
+local restoreHitbox
+local rayFilterDirty = false
 
 local function connect(signal, callback, bucket)
     local connection = signal:Connect(callback)
@@ -234,6 +244,7 @@ local function cleanup()
     for _, record in pairs(records) do
         disconnectAll(record.playerConnections)
         disconnectAll(record.characterConnections)
+        if restoreHitbox then restoreHitbox(record) end
         destroyVisuals(record)
     end
     table.clear(records)
@@ -265,6 +276,7 @@ end
 local function clearCharacter(record)
     if target == record then target = nil; scanElapsed = math.huge end
     disconnectAll(record.characterConnections)
+    if restoreHitbox then restoreHitbox(record) end
     destroyVisuals(record)
     record.character, record.humanoid = nil, nil
     record.root, record.aimPart, record.labelPart = nil, nil, nil
@@ -283,7 +295,9 @@ local function setCharacter(record, character)
     connect(character.ChildRemoved, function(child)
         local changedAim = child == record.aimPart or child == record.humanoid
         local changedVisual = child == record.root or child == record.labelPart or child == record.humanoid
-        if not changedAim and not changedVisual then return end
+        local changedHitbox = child == record.hitboxPart
+        if not changedAim and not changedVisual and not changedHitbox then return end
+        if changedHitbox and restoreHitbox then restoreHitbox(record) end
         refreshParts(record)
         if changedAim and target == record then target = nil; scanElapsed = math.huge end
         -- A cached adornee may have just streamed out.
@@ -292,6 +306,7 @@ local function setCharacter(record, character)
     connect(character.AncestryChanged, function()
         if not character:IsDescendantOf(Workspace) then
             if target == record then target = nil end
+            if restoreHitbox then restoreHitbox(record) end
             destroyVisuals(record)
         end
         espElapsed = math.huge
@@ -360,7 +375,13 @@ refreshRayFilter = function()
     local exclude = {visuals}
     if localPlayer.Character then table.insert(exclude, localPlayer.Character) end
     if camera then table.insert(exclude, camera) end -- Ignore camera-parented viewmodels.
+    -- Artificially enlarged roots must not make a torso behind a wall seem visible.
+    -- These exclusions apply only to this assist's visibility queries.
+    for _, record in pairs(records) do
+        if record.hitboxPart then table.insert(exclude, record.hitboxPart) end
+    end
     rayParams.FilterDescendantsInstances = exclude
+    rayFilterDirty = false
 end
 
 local function visible(character, position)
@@ -410,7 +431,73 @@ local function acquireTarget(radiusSquared)
     return best, bestPosition
 end
 
--- 5. ESP --------------------------------------------------------------------------
+-- 5. Local root resize and ESP ----------------------------------------------------
+restoreHitbox = function(record)
+    local part, original = record.hitboxPart, record.hitboxOriginal
+    record.hitboxPart, record.hitboxOriginal = nil, nil
+    record.hitboxWantedSize, record.hitboxSizeSetting = nil, nil
+    if record.hitboxMarker then record.hitboxMarker:Destroy(); record.hitboxMarker = nil end
+    if part and original then
+        local ok, err = pcall(function()
+            part.Size = original.Size
+            part.CanCollide = original.CanCollide
+            part.CanQuery = original.CanQuery
+        end)
+        if not ok then warn("[ArsenalAssist] Local size restore failed: " .. tostring(err)) end
+        rayFilterDirty = true
+    end
+end
+
+local function updateRecordHitbox(record)
+    local settings = Config.Hitbox
+    local root = record.root
+    if not settings.Enabled or not camera or not recordIsPresent(record) or not isAlive(record)
+        or not isEnemy(record.player, settings.TeamCheck) or not partIsPresent(root, record.character)
+        or root.Name ~= "HumanoidRootPart"
+        or (root.Position - camera.CFrame.Position).Magnitude > settings.MaxDistance then
+        restoreHitbox(record)
+        return
+    end
+    if record.hitboxPart ~= root then
+        restoreHitbox(record)
+        record.hitboxOriginal = {Size = root.Size, CanCollide = root.CanCollide, CanQuery = root.CanQuery}
+        record.hitboxPart = root
+        rayFilterDirty = true
+    end
+    if record.hitboxSizeSetting ~= settings.Size then
+        local size = record.hitboxOriginal.Size
+        record.hitboxWantedSize = Vector3.new(math.max(size.X, settings.Size),
+            math.max(size.Y, settings.Size), math.max(size.Z, settings.Size))
+        record.hitboxSizeSetting = settings.Size
+    end
+    -- Only local geometry/query flags change. No damage remotes or touch events.
+    if root.Size ~= record.hitboxWantedSize then root.Size = record.hitboxWantedSize end
+    if root.CanCollide then root.CanCollide = false end
+    if not root.CanQuery then root.CanQuery = true end
+    if settings.ShowBox then
+        if not record.hitboxMarker then
+            local marker = Instance.new("BoxHandleAdornment")
+            marker.Name = "Hitbox_" .. tostring(record.player.UserId)
+            marker.Adornee = root
+            marker.Color3 = Color3.fromRGB(255, 183, 96)
+            marker.Transparency = 0.85
+            marker.ZIndex = 1
+            marker.Parent = visuals
+            record.hitboxMarker = marker
+        end
+        record.hitboxMarker.Size = record.hitboxWantedSize
+        record.hitboxMarker.AlwaysOnTop = Config.ESP.ThroughWalls
+    elseif record.hitboxMarker then
+        record.hitboxMarker:Destroy()
+        record.hitboxMarker = nil
+    end
+end
+
+local function updateAllHitboxes()
+    for _, record in pairs(records) do updateRecordHitbox(record) end
+    if rayFilterDirty then refreshRayFilter() end
+end
+
 local OUTLINE_COLOR = Color3.fromRGB(255, 114, 104)
 local function suspendVisuals(record)
     if record.highlight then record.highlight.Enabled = false end
@@ -534,6 +621,7 @@ local function applyConfig(patch)
         for _, record in pairs(records) do destroyVisuals(record) end
     end
     espElapsed = math.huge
+    updateAllHitboxes()
     updateAllESP()
     refreshUI()
     return true, copy(Config)
@@ -650,9 +738,32 @@ local function buildUI()
         connect(minus.Activated, function() applyConfig({[section] = {[key] = Config[section][key] - step}}) end)
         connect(plus.Activated, function() applyConfig({[section] = {[key] = Config[section][key] + step}}) end)
     end
+    local aimPresets = {
+        {Name = "Subtle", Strength = 0.055, FOV = 75},
+        {Name = "Tablet", Strength = 0.22, FOV = 140},
+        {Name = "Fast", Strength = 0.35, FOV = 180},
+    }
+    local function presetIndex()
+        for i, preset in ipairs(aimPresets) do
+            if Config.AimAssist.Smoothness == preset.Strength and Config.AimAssist.FOV == preset.FOV then return i end
+        end
+        return 0
+    end
+    order = order + 1
+    local presetButton = button(list, "", UDim2.new(1, -8, 0, rowHeight))
+    presetButton.Name = "AimPreset"
+    presetButton.LayoutOrder = order
+    table.insert(refreshers, function()
+        local index = presetIndex()
+        presetButton.Text = "Aim preset: " .. (index > 0 and aimPresets[index].Name or "Custom")
+    end)
+    connect(presetButton.Activated, function()
+        local preset = aimPresets[presetIndex() % #aimPresets + 1]
+        applyConfig({AimAssist = {Smoothness = preset.Strength, FOV = preset.FOV}})
+    end)
     toggle("Aim assist [F2]", "AimAssist", "Enabled")
     toggle("ESP [F3]", "ESP", "Enabled")
-    numeric("Tracking strength", "AimAssist", "Smoothness", 0.005, "%.3f")
+    numeric("Tracking strength", "AimAssist", "Smoothness", 0.025, "%.3f")
     numeric("FOV radius (pixels)", "AimAssist", "FOV", 5, "%.0f")
     numeric("ESP range (studs)", "ESP", "MaxDistance", 25, "%.0f")
     toggle("Show FOV [F4]", "AimAssist", "ShowFOV")
@@ -665,6 +776,10 @@ local function buildUI()
     toggle("Names", "ESP", "ShowNames")
     toggle("Health", "ESP", "ShowHealth")
     toggle("Distance", "ESP", "ShowDistance")
+    toggle("Local hitbox resize", "Hitbox", "Enabled")
+    numeric("Local size (studs)", "Hitbox", "Size", 1, "%.0f")
+    toggle("Show local size box", "Hitbox", "ShowBox")
+    toggle("Hitbox team filter", "Hitbox", "TeamCheck")
     order = order + 1
     local touchMode = button(list, "", UDim2.new(1, -8, 0, rowHeight))
     touchMode.Name = "TouchMode"
@@ -681,7 +796,7 @@ local function buildUI()
     -- This dock is a sibling of Panel, so hiding settings never removes touch controls.
     touchDock = create("Frame", {
         Name = "TouchControls", AnchorPoint = Vector2.new(0.5, 0.5),
-        Size = UDim2.fromOffset(144, 252), BackgroundColor3 = Color3.fromRGB(24, 29, 39),
+        Size = UDim2.fromOffset(144, 306), BackgroundColor3 = Color3.fromRGB(24, 29, 39),
         BackgroundTransparency = 0.10, BorderSizePixel = 0, Visible = false, Active = true,
     }, gui)
     create("UICorner", {CornerRadius = UDim.new(0, 10)}, touchDock)
@@ -693,9 +808,11 @@ local function buildUI()
     touchAimButton.TextSize = 15
     touchESPButton = button(touchDock, "ESP: ON", UDim2.fromOffset(128, 48), UDim2.fromOffset(8, 88))
     touchESPButton.Name = "ESPButton"
-    local settings = button(touchDock, "SETTINGS", UDim2.fromOffset(128, 48), UDim2.fromOffset(8, 142))
+    touchHitboxButton = button(touchDock, "HITBOX: ON", UDim2.fromOffset(128, 48), UDim2.fromOffset(8, 142))
+    touchHitboxButton.Name = "HitboxButton"
+    local settings = button(touchDock, "SETTINGS", UDim2.fromOffset(128, 48), UDim2.fromOffset(8, 196))
     settings.Name = "SettingsButton"
-    local touchUnload = button(touchDock, "UNLOAD", UDim2.fromOffset(128, 48), UDim2.fromOffset(8, 196))
+    local touchUnload = button(touchDock, "UNLOAD", UDim2.fromOffset(128, 48), UDim2.fromOffset(8, 250))
     touchUnload.Name = "UnloadButton"
 
     refreshTouchState = function()
@@ -704,14 +821,16 @@ local function buildUI()
         if touchAimButton.Text ~= text then touchAimButton.Text = text end
         local espText = Config.ESP.Enabled and "ESP: ON" or "ESP: OFF"
         if touchESPButton.Text ~= espText then touchESPButton.Text = espText end
+        local hitboxText = Config.Hitbox.Enabled and "HITBOX: ON" or "HITBOX: OFF"
+        if touchHitboxButton.Text ~= hitboxText then touchHitboxButton.Text = hitboxText end
     end
     layoutTouchDock = function()
         local viewport = camera and camera.ViewportSize
         touchDock.Visible = Config.Mobile.Enabled and UserInputService.TouchEnabled
             and viewport ~= nil and viewport.X >= 48 and viewport.Y >= 48
         if not touchDock.Visible then return end
-        local scale = math.min(Config.Mobile.ButtonScale, (viewport.X - 24) / 144, (viewport.Y - 24) / 252)
-        local insetX, insetY = 12 + 72 * scale, 12 + 126 * scale
+        local scale = math.min(Config.Mobile.ButtonScale, (viewport.X - 24) / 144, (viewport.Y - 24) / 306)
+        local insetX, insetY = 12 + 72 * scale, 12 + 153 * scale
         local x = math.clamp(Config.Mobile.DockX * viewport.X, insetX, viewport.X - insetX)
         local y = math.clamp(Config.Mobile.DockY * viewport.Y, insetY, viewport.Y - insetY)
         touchDockCenter = Vector2.new(x, y)
@@ -743,6 +862,7 @@ local function buildUI()
         end
     end)
     connect(touchESPButton.Activated, function() applyConfig({ESP = {Enabled = not Config.ESP.Enabled}}) end)
+    connect(touchHitboxButton.Activated, function() applyConfig({Hitbox = {Enabled = not Config.Hitbox.Enabled}}) end)
     connect(settings.Activated, function() panel.Visible = not panel.Visible end)
     connect(touchUnload.Activated, cleanup)
     connect(handle.InputBegan, function(input)
@@ -806,6 +926,7 @@ local lastViewport = Vector2.new(-1, -1)
 local lastFOV = -1
 local function onRender(dt)
     if not running then return end
+    if rayFilterDirty then refreshRayFilter() end
     if not camera or not camera.Parent then
         target = nil
         if fovCircle then fovCircle.Visible = false end
@@ -926,6 +1047,7 @@ local ok, initError = xpcall(function()
         if espElapsed < interval then return end
         espElapsed = 0
         local success, err = xpcall(function()
+            updateAllHitboxes()
             updateAllESP()
             local name = target and target.player.Name or "none"
             statusLabel.Text = (UserInputService.TouchEnabled and "Use AIM button | SETTINGS: panel\nTarget: "
@@ -944,3 +1066,4 @@ if not ok then
     warn("[ArsenalAssist] Initialization failed: " .. tostring(initError))
     cleanup()
 end
+
