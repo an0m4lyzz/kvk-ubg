@@ -1,6 +1,18 @@
-# Tablet assist: tablet3 diagnostic revision
+# Tablet assist: tablet4 head/torso preference
 
 This client script controls the camera and visuals. **It does not fire weapons or change the game's fire rate. Continue using the game's manual fire button.**
+
+## Head / torso preference
+
+The default **HeadChance = 0.70** means a new lock prefers the Head with probability 70%; otherwise it prefers the configured body part (UpperTorso, with standard R6 Torso/root fallback). Adjust **SETTINGS → Head preference** in 10 percentage-point steps.
+
+The preference is sampled once for a search/new lock, not every render or shot. Empty searches retain their pending choice, and a valid retained part stays stable. If the chosen part becomes missing, blocked, or outside FOV, the script tries the other eligible visible point. With HeadChance zero, head fallback is disabled. HeadChance one gives head priority with body fallback when necessary.
+
+Unlocked reselection queues a next-lock preference, ranks actual eligible points before switching players, and preserves the existing point when the current player remains nearest. Losing an unselected torso does not reset a valid head lock.
+
+This is an **aim-point preference**, not a promised percentage of headshots, kills, or bullets. Manual firing, visibility, weapon spread, movement, and server validation affect actual results. A head-preferred lock may keep aiming at the head for its entire duration. No ratio guarantees avoiding suspicion or detection, and no anti-cheat bypass is included.
+
+Stats/report expose the actual selected aim part. The settings status shows that part while tracking.
 
 ## Changes for inconsistent locking
 
@@ -44,10 +56,11 @@ Only Size, CanCollide, and CanQuery change locally; CanTouch is untouched. Origi
 
 ## Verification and limits
 
-Official standalone Luau 0.745 compilation passed. All **230 local checks passed**: 21 scalar smoothing checks, 73 client/lifecycle checks, 38 touch checks, 36 local-resize checks, and 62 tracking/scheduler checks. An independent static review identified a recoil-feedback issue; its regression was reproduced before fixing and now passes.
+Official standalone Luau 0.745 compilation passed. All **267 local checks passed**: 21 scalar smoothing checks, 73 client/lifecycle checks, 38 touch checks, 36 local-resize checks, 62 tracking/scheduler checks, and 37 head-preference checks. Independent static reviews identified recoil-feedback, selected-part invalidation, and unlocked-ranking issues. Their covering regressions were reproduced before fixing and now pass.
 
 New regressions reproduce and verify: next-render acquisition after an empty scan; cumulative convergence with an absolute-reset camera; convergence with a camera following CurrentCamera; late camera writers; release continuity; zero-strength native input; position changes before preparation; observed and unobserved incremental recoil; early resets to a known base; alignment status; obstruction/FOV/camera reasons; and complete render-phase cleanup.
 
-The scheduler/rotation fixture is a deterministic yaw-camera test double. It does not validate real Roblox 3D camera controllers, tablet touch delivery, weapon sampling phases, live Arsenal, server hit acceptance, latency, or hardware performance. Client gun code can sample the camera in different engine phases; this script does not hook or verify those weapon paths. If status is LOCKED but manual shots are delayed or rejected, actual game/input/network evidence is needed.
+The new preference checks use scripted uniform samples to verify threshold behavior, stable choice lifetime, visible/missing-part fallback, queued unlocked reselection, and cleanup. They do not validate a live headshot distribution. The scheduler/rotation fixture is a deterministic yaw-camera test double. It does not validate real Roblox 3D camera controllers, tablet touch delivery, weapon sampling phases, live Arsenal, server hit acceptance, latency, or hardware performance. Client gun code can sample the camera in different engine phases; this script does not hook or verify those weapon paths. If status is LOCKED but manual shots are delayed or rejected, actual game/input/network evidence is needed.
 
-Primary references: [CFrame composition and FuzzyEq](https://create.roblox.com/docs/reference/engine/datatypes/CFrame), [render callback priorities](https://create.roblox.com/docs/reference/engine/classes/RunService), [raycasting](https://create.roblox.com/docs/workspace/raycasting), [server-side weapon validation](https://create.roblox.com/docs/scripting/security/client-server-boundary).
+Primary references: [Random](https://create.roblox.com/docs/reference/engine/datatypes/Random), [CFrame composition and FuzzyEq](https://create.roblox.com/docs/reference/engine/datatypes/CFrame), [render callback priorities](https://create.roblox.com/docs/reference/engine/classes/RunService), [raycasting](https://create.roblox.com/docs/workspace/raycasting), [server-side weapon validation](https://create.roblox.com/docs/scripting/security/client-server-boundary).
+
