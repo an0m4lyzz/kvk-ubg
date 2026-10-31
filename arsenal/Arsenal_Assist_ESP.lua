@@ -1,4 +1,5 @@
 -- Arsenal_Assist_ESP.lua
+-- Revision: tablet3, cumulative camera tracking and on-device diagnostics.
 -- Client source: LocalScript in your own place, or a client runtime exposing Roblox APIs.
 -- No Studio-only restriction, remote manipulation, or external dependency.
 -- See README.md in this directory for controls, local-resize limits, and verification scope.
@@ -7,8 +8,8 @@ local Config = {
     AimAssist = {
         Enabled = true,
         ActivationKey = Enum.UserInputType.MouseButton2,
-        FOV = 140, -- Radius in viewport pixels, not degrees or studs.
-        Smoothness = 0.22, -- Faster tablet preset; fraction corrected in 1/60 second.
+        FOV = 180, -- Fast tablet preset; radius in viewport pixels.
+        Smoothness = 0.35, -- Fraction corrected in 1/60 second; no instant snapping.
         TargetPart = "UpperTorso",
         TeamCheck = true,
         WallCheck = true,
@@ -29,7 +30,7 @@ local Config = {
         MaxDistance = 300, -- Studs from the current camera to character root.
     },
     Hitbox = {
-        Enabled = true, -- Experimental LOCAL resize; server hit acceptance is unverified.
+        Enabled = false, -- Opt in: LOCAL resize can confound server hit registration.
         Size = 6, -- Minimum root-part size on each axis, in studs; never shrink originals.
         ShowBox = true, -- Visualizes the local resize, not confirmed damage registration.
         TeamCheck = true,
@@ -39,8 +40,8 @@ local Config = {
         Enabled = true, -- Show touch controls when TouchEnabled is true.
         ActivationMode = "Toggle", -- "Toggle" (tap on/off) or "Hold".
         ButtonScale = 1,
-        DockX = 0.90, -- Normalized dock center; draggable and clamped onscreen.
-        DockY = 0.42,
+        DockX = 0.10, -- Left side by default to keep the right fire-control area clear.
+        DockY = 0.35,
     },
     Performance = {
         OptimizeESP = true,
@@ -186,6 +187,14 @@ local windowFocused = true
 local menuOpen = false
 local renderBound = false
 local renderName = "ArsenalAssistESP_" .. HttpService:GenerateGUID(false)
+local renderBindings = {}
+local cameraOffset, previousBaseFrame, lastWrittenFrame, lastWriteCamera
+local wroteThisFrame = false
+local diagnostics = {
+    State = "IDLE", Detail = "manual fire", Frames = 0, ActiveFrames = 0,
+    Scans = 0, Candidates = 0, InFOV = 0, Blocked = 0, Outside = 0,
+    CameraOverwrites = 0, CameraRebases = 0, PixelError = nil,
+}
 local highlightCount = 0
 local espElapsed = 0
 local scanElapsed = math.huge
@@ -198,6 +207,17 @@ local refreshTouchState
 local layoutTouchDock
 local restoreHitbox
 local rayFilterDirty = false
+
+local function resetCameraMemory()
+    cameraOffset, previousBaseFrame, lastWrittenFrame, lastWriteCamera = nil, nil, nil, nil
+    wroteThisFrame = false
+end
+
+local function setAimStatus(state, detail)
+    local changed = diagnostics.State ~= state or diagnostics.Detail ~= detail
+    diagnostics.State, diagnostics.Detail = state, detail
+    if changed and refreshTouchState then refreshTouchState() end
+end
 
 local function connect(signal, callback, bucket)
     local connection = signal:Connect(callback)
@@ -216,6 +236,10 @@ local function releaseAim()
     touchInput = nil
     target = nil
     scanElapsed = math.huge
+    resetCameraMemory()
+    diagnostics.ActiveFrames = 0
+    diagnostics.PixelError = nil
+    setAimStatus("IDLE", "manual fire")
     if refreshTouchState then refreshTouchState() end
 end
 
@@ -236,10 +260,9 @@ local function cleanup()
     running = false
     dragInput = nil
     releaseAim()
-    if renderBound then
-        RunService:UnbindFromRenderStep(renderName)
-        renderBound = false
-    end
+    for _, name in ipairs(renderBindings) do RunService:UnbindFromRenderStep(name) end
+    table.clear(renderBindings)
+    renderBound = false
     disconnectAll(connections)
     for _, record in pairs(records) do
         disconnectAll(record.playerConnections)
@@ -393,20 +416,21 @@ local function visible(character, position)
 end
 
 local function eligibleTarget(record, radiusSquared)
-    if not recordIsPresent(record) or not isEnemy(record.player, Config.AimAssist.TeamCheck)
-        or (Config.AimAssist.AliveCheck and not isAlive(record))
-        or not partIsPresent(record.aimPart, record.character) then return nil end
+    if not recordIsPresent(record) then return nil, nil, "INVALID" end
+    if not isEnemy(record.player, Config.AimAssist.TeamCheck) then return nil, nil, "TEAM" end
+    if Config.AimAssist.AliveCheck and not isAlive(record) then return nil, nil, "DEAD" end
+    if not partIsPresent(record.aimPart, record.character) then return nil, nil, "PART" end
 
     local position = record.aimPart.Position
     if Config.AimAssist.Prediction then
         position = position + record.aimPart.AssemblyLinearVelocity * Config.AimAssist.PredictionSeconds
     end
     local point, onScreen = camera:WorldToViewportPoint(position)
-    if not onScreen or point.Z <= 0 then return nil end
+    if not onScreen or point.Z <= 0 then return nil, nil, "OFFSCREEN" end
     local dx = point.X - camera.ViewportSize.X * 0.5
     local dy = point.Y - camera.ViewportSize.Y * 0.5
     local distanceSquared = dx * dx + dy * dy
-    if distanceSquared > radiusSquared then return nil end
+    if distanceSquared > radiusSquared then return nil, nil, "FOV" end
     return position, distanceSquared
 end
 
@@ -419,14 +443,26 @@ end
 
 local function acquireTarget(radiusSquared)
     local best, bestPosition, bestDistance = nil, nil, math.huge
+    diagnostics.Scans = diagnostics.Scans + 1
+    diagnostics.Candidates, diagnostics.InFOV, diagnostics.Blocked, diagnostics.Outside = 0, 0, 0, 0
     for _, record in pairs(records) do
-        local position, distanceSquared = eligibleTarget(record, radiusSquared)
+        diagnostics.Candidates = diagnostics.Candidates + 1
+        local position, distanceSquared, reason = eligibleTarget(record, radiusSquared)
+        if position then diagnostics.InFOV = diagnostics.InFOV + 1
+        elseif reason == "FOV" or reason == "OFFSCREEN" then diagnostics.Outside = diagnostics.Outside + 1 end
         local winsTie = best ~= nil and distanceSquared == bestDistance
             and record.player.UserId < best.player.UserId
-        if position and (distanceSquared < bestDistance or winsTie)
-            and targetIsVisible(record, position) then
-            best, bestPosition, bestDistance = record, position, distanceSquared
+        if position and (distanceSquared < bestDistance or winsTie) then
+            if targetIsVisible(record, position) then
+                best, bestPosition, bestDistance = record, position, distanceSquared
+            else diagnostics.Blocked = diagnostics.Blocked + 1 end
         end
+    end
+    if not best then
+        if diagnostics.Candidates == 0 then setAimStatus("NO_PLAYERS", "no other players")
+        elseif diagnostics.InFOV > 0 and diagnostics.Blocked > 0 then setAimStatus("BLOCKED", "obstruction")
+        elseif diagnostics.Outside > 0 then setAimStatus("OUTSIDE_FOV", "move camera closer")
+        else setAimStatus("NO_ELIGIBLE", "team, health or parts") end
     end
     return best, bestPosition
 end
@@ -642,7 +678,20 @@ local function getStats()
         TargetUserId = target and target.player.UserId or nil,
         ActivationHeld = held, RenderBound = renderBound,
         ActivationSource = activationSource,
+        Revision = "tablet3",
+        RenderPhases = #renderBindings,
+        Diagnostics = copy(diagnostics),
     }
+end
+
+local function diagnosticReport()
+    local errorText = diagnostics.PixelError and string.format("%.1f", diagnostics.PixelError) or "none"
+    return string.format("KVK Arsenal tablet3 | manual fire\nstate=%s (%s)\ntarget=%s camera=%s armed=%s\nFOV=%d strength=%.3f errorPx=%s\nscans=%d candidates=%d inFOV=%d blocked=%d overrides=%d rebases=%d\nlocalHitbox=%s",
+        diagnostics.State, diagnostics.Detail, target and target.player.Name or "none",
+        camera and camera.CameraType.Name or "none", tostring(held), Config.AimAssist.FOV,
+        Config.AimAssist.Smoothness, errorText, diagnostics.Scans, diagnostics.Candidates,
+        diagnostics.InFOV, diagnostics.Blocked, diagnostics.CameraOverwrites,
+        diagnostics.CameraRebases, tostring(Config.Hitbox.Enabled))
 end
 
 configureFunction.OnInvoke = function(action, payload)
@@ -650,7 +699,8 @@ configureFunction.OnInvoke = function(action, payload)
     if action == "Patch" then return applyConfig(payload) end
     if action == "Reset" then return applyConfig(copy(defaults)) end
     if action == "Stats" then return getStats() end
-    return false, "Use Get, Patch, Reset, or Stats."
+    if action == "Report" then return diagnosticReport() end
+    return false, "Use Get, Patch, Reset, Stats, or Report."
 end
 
 local function create(className, props, parent)
@@ -685,6 +735,7 @@ local function buildUI()
         TextSize = 17, TextColor3 = Color3.fromRGB(235, 240, 250), TextXAlignment = Enum.TextXAlignment.Left,
     }, panel)
     statusLabel = create("TextLabel", {
+        Name = "LockStatus",
         Position = UDim2.fromOffset(14, 36), Size = UDim2.fromOffset(312, 34),
         BackgroundTransparency = 1, Text = "RMB: hold to track | F1: hide panel", Font = Enum.Font.Gotham,
         TextSize = 12, TextColor3 = Color3.fromRGB(170, 183, 205), TextWrapped = true,
@@ -761,6 +812,16 @@ local function buildUI()
         local preset = aimPresets[presetIndex() % #aimPresets + 1]
         applyConfig({AimAssist = {Smoothness = preset.Strength, FOV = preset.FOV}})
     end)
+    order = order + 1
+    local copyDiagnostics = button(list, "Copy diagnostics", UDim2.new(1, -8, 0, rowHeight))
+    copyDiagnostics.Name = "CopyDiagnostics"
+    copyDiagnostics.LayoutOrder = order
+    connect(copyDiagnostics.Activated, function()
+        local report = diagnosticReport()
+        local copied = type(setclipboard) == "function" and pcall(setclipboard, report)
+        if not copied then print(report) end
+        copyDiagnostics.Text = copied and "Diagnostics copied" or "Diagnostics printed to output"
+    end)
     toggle("Aim assist [F2]", "AimAssist", "Enabled")
     toggle("ESP [F3]", "ESP", "Enabled")
     numeric("Tracking strength", "AimAssist", "Smoothness", 0.025, "%.3f")
@@ -797,7 +858,7 @@ local function buildUI()
     touchDock = create("Frame", {
         Name = "TouchControls", AnchorPoint = Vector2.new(0.5, 0.5),
         Size = UDim2.fromOffset(144, 306), BackgroundColor3 = Color3.fromRGB(24, 29, 39),
-        BackgroundTransparency = 0.10, BorderSizePixel = 0, Visible = false, Active = true,
+        BackgroundTransparency = 0.10, BorderSizePixel = 0, Visible = false, Active = false,
     }, gui)
     create("UICorner", {CornerRadius = UDim.new(0, 10)}, touchDock)
     touchScale = create("UIScale", {Scale = 1}, touchDock)
@@ -818,6 +879,7 @@ local function buildUI()
     refreshTouchState = function()
         local text = Config.Mobile.ActivationMode == "Hold" and (held and "HOLD AIM: ON" or "HOLD AIM")
             or (held and "AIM: ON" or "AIM: OFF")
+        if held then text = text .. "\n" .. diagnostics.State end
         if touchAimButton.Text ~= text then touchAimButton.Text = text end
         local espText = Config.ESP.Enabled and "ESP: ON" or "ESP: OFF"
         if touchESPButton.Text ~= espText then touchESPButton.Text = espText end
@@ -849,6 +911,7 @@ local function buildUI()
         activationSource = holdMode and "TouchHold" or "TouchToggle"
         touchInput = holdMode and input or nil
         scanElapsed = math.huge
+        setAimStatus("SEARCHING", "manual fire")
         refreshTouchState()
     end
     connect(touchAimButton.Activated, function(input)
@@ -924,11 +987,34 @@ end
 
 local lastViewport = Vector2.new(-1, -1)
 local lastFOV = -1
+
+local function prepareCamera(dt)
+    wroteThisFrame = false
+    if not running or not held or not Config.AimAssist.Enabled or not camera or not camera.Parent then return end
+    if dt <= 0 or dt > 0.25 or camera.CameraType ~= Enum.CameraType.Custom then resetCameraMemory(); return end
+    -- Translation can change independently, so compare rotations and preserve the
+    -- current position. An unknown external rotation must not receive stale carry.
+    if previousBaseFrame and lastWrittenFrame and lastWriteCamera == camera then
+        local rotation = camera.CFrame.Rotation
+        if rotation:FuzzyEq(lastWrittenFrame.Rotation, 0.00001) then
+            camera.CFrame = CFrame.new(camera.CFrame.Position) * previousBaseFrame.Rotation
+        elseif not rotation:FuzzyEq(previousBaseFrame.Rotation, 0.00001) then
+            -- Native camera already owns a changed view (for example recoil).
+            -- Commit it as the new base instead of adding our old correction twice.
+            diagnostics.CameraRebases = diagnostics.CameraRebases + 1
+            resetCameraMemory()
+        end
+    end
+end
+
 local function onRender(dt)
     if not running then return end
+    diagnostics.Frames = diagnostics.Frames + 1
     if rayFilterDirty then refreshRayFilter() end
     if not camera or not camera.Parent then
         target = nil
+        resetCameraMemory()
+        setAimStatus("WAIT_CAMERA", "CurrentCamera unavailable")
         if fovCircle then fovCircle.Visible = false end
         if touchDock then touchDock.Visible = false end
         return
@@ -957,9 +1043,20 @@ local function onRender(dt)
         or UserInputService.VREnabled or camera.CameraType ~= Enum.CameraType.Custom
         or not localCharacterIsAlive() then
         target = nil
+        resetCameraMemory()
+        if camera.CameraType ~= Enum.CameraType.Custom then setAimStatus("CAMERA_PAUSED", camera.CameraType.Name)
+        elseif not localCharacterIsAlive() then setAimStatus("NO_CHARACTER", "waiting for alive character")
+        elseif UserInputService.VREnabled then setAimStatus("CAMERA_PAUSED", "VR")
+        else setAimStatus("PAUSED", "frame or viewport unavailable") end
         scanElapsed = math.huge
         return
     end
+
+    diagnostics.ActiveFrames = diagnostics.ActiveFrames + 1
+    local baseFrame = camera.CFrame
+    -- Carry correction across frames even when the game writes an absolute base
+    -- angle each frame. Project targets from the actual carried view, not the base.
+    if cameraOffset then camera.CFrame = baseFrame * cameraOffset end
 
     local radiusSquared = Config.AimAssist.FOV * Config.AimAssist.FOV
     local position = nil
@@ -972,16 +1069,39 @@ local function onRender(dt)
         end
     end
     scanElapsed = scanElapsed + dt
-    if (not target or not Config.AimAssist.TargetLock)
-        and scanElapsed >= Config.Performance.AcquireInterval then
+    -- An empty search must not delay a newly eligible target on the next frame.
+    -- Only optional reselection of an already valid target is rate limited.
+    if not target or (not Config.AimAssist.TargetLock
+        and scanElapsed >= Config.Performance.AcquireInterval) then
         target, position = acquireTarget(radiusSquared)
         scanElapsed = 0
     end
-    if not target or not position or Config.AimAssist.Smoothness == 0 then return end
+    if not target or not position then resetCameraMemory(); diagnostics.PixelError = nil; return end
+    if Config.AimAssist.Smoothness == 0 then resetCameraMemory(); setAimStatus("PAUSED", "strength is zero"); return end
     local current = camera.CFrame
     if (position - current.Position).Magnitude < 0.001 then return end
     local goal = CFrame.lookAt(current.Position, position, current.UpVector)
     camera.CFrame = current:Lerp(goal, smoothingAlpha(Config.AimAssist.Smoothness, dt))
+    previousBaseFrame = baseFrame
+    lastWrittenFrame, lastWriteCamera = camera.CFrame, camera
+    cameraOffset = baseFrame.Rotation:ToObjectSpace(lastWrittenFrame.Rotation)
+    wroteThisFrame = true
+    local point = camera:WorldToViewportPoint(position)
+    local dx, dy = point.X - viewport.X * 0.5, point.Y - viewport.Y * 0.5
+    diagnostics.PixelError = math.sqrt(dx * dx + dy * dy)
+    setAimStatus(diagnostics.PixelError <= 4 and "LOCKED" or "TRACKING", "manual fire")
+end
+
+local function observeCamera()
+    -- Best effort at this priority only; no universal final camera writer exists.
+    if running and wroteThisFrame and camera == lastWriteCamera
+        and not camera.CFrame.Rotation:FuzzyEq(lastWrittenFrame.Rotation, 0.00001) then
+        diagnostics.CameraOverwrites = diagnostics.CameraOverwrites + 1
+        diagnostics.CameraRebases = diagnostics.CameraRebases + 1
+        diagnostics.PixelError = nil
+        resetCameraMemory()
+        setAimStatus("CAMERA_OVERRIDE", "another camera writer")
+    end
 end
 
 -- 8. Initialization with fail-closed teardown -------------------------------------
@@ -1010,6 +1130,7 @@ local ok, initError = xpcall(function()
             held = true
             activationSource = "Hardware"
             scanElapsed = math.huge
+            setAimStatus("SEARCHING", "manual fire")
             refreshTouchState()
         end
         local key = input.KeyCode
@@ -1050,15 +1171,21 @@ local ok, initError = xpcall(function()
             updateAllHitboxes()
             updateAllESP()
             local name = target and target.player.Name or "none"
-            statusLabel.Text = (UserInputService.TouchEnabled and "Use AIM button | SETTINGS: panel\nTarget: "
-                or "Hold activation to track | F1: panel\nTarget: ") .. name
+            statusLabel.Text = diagnostics.State .. " | " .. diagnostics.Detail .. "\nTarget: " .. name
         end, debug.traceback)
         if not success then warn("[ArsenalAssist] ESP stopped: " .. tostring(err)); cleanup() end
     end)
-    RunService:BindToRenderStep(renderName, Enum.RenderPriority.Camera.Value + 1, function(dt)
-        local success, err = xpcall(onRender, debug.traceback, dt)
-        if not success then warn("[ArsenalAssist] Camera stopped: " .. tostring(err)); cleanup() end
-    end)
+    local function bindPhase(name, priority, callback)
+        RunService:BindToRenderStep(name, priority, function(dt)
+            if not running then return end
+            local success, err = xpcall(callback, debug.traceback, dt)
+            if not success then warn("[ArsenalAssist] Camera stopped: " .. tostring(err)); cleanup() end
+        end)
+        table.insert(renderBindings, name)
+    end
+    bindPhase(renderName .. "_Prepare", Enum.RenderPriority.Camera.Value - 1, prepareCamera)
+    bindPhase(renderName, Enum.RenderPriority.Last.Value + 1, onRender)
+    bindPhase(renderName .. "_Observe", Enum.RenderPriority.Last.Value + 2, observeCamera)
     renderBound = true
     if Config.Performance.DebugMode then print("[ArsenalAssist] Initialized. F1 panel; End unload.") end
 end, debug.traceback)
@@ -1066,4 +1193,5 @@ if not ok then
     warn("[ArsenalAssist] Initialization failed: " .. tostring(initError))
     cleanup()
 end
+
 
