@@ -33,10 +33,15 @@ end
 local function keyType(name)
     local k=name:lower():gsub("[_%-%s]","")
     if k:find("style",1,true) then return "STYLE" end
-    if k:find("mode",1,true) or k:find("stance",1,true)
-        or k:find("focus",1,true) or k:find("form",1,true)
-        or k:find("monstrosity",1,true) or k:find("transformation",1,true)
-        or k=="flicker" or k=="whirlwind" then return "MODE" end
+    -- SlowMoDebounce and similar timestamps are not stance/mode indicators.
+    local modeKeys = {
+        mode=true, currentmode=true, equippedmode=true, stancemode=true,
+        stance=true, currentstance=true, currentform=true, form=true,
+        transformation=true, focus=true, focusmode=true,
+        monstrosity=true, flicker=true, whirlwind=true,
+        surgeonmode=true, drivemode=true
+    }
+    if modeKeys[k] then return "MODE" end
     return nil
 end
 local function accept(path,key,value)
@@ -44,6 +49,8 @@ local function accept(path,key,value)
     if not kind then return end
     local vt=type(value)
     if vt~="string" and vt~="number" and vt~="boolean" then return end
+    -- Reject clock-like mode values even if the field name seems plausible.
+    if kind=="MODE" and type(value)=="number" and value>100000000 then return end
     local text=tostring(value)
     if #text>55 then text=text:sub(1,55).."..." end
     local entry=kind.." "..path.."."..key.." = "..text
